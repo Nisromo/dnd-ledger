@@ -3072,7 +3072,11 @@ async function enterCloudMode(){
     render();
     showToast("Signed in — your characters are now synced to your account.");
   }catch(e){
-    failCloudMode("Signed in, but couldn't reach the server to load your characters. You're back to this device's local characters for now.");
+    // Log the real underlying error to the console (it was being silently swallowed before —
+    // the toast alone couldn't show enough detail to diagnose a connectivity-level failure like
+    // a blocked request or a CORS rejection, as opposed to a clean error response from Supabase).
+    console.error("Cloud sync failed:", e);
+    failCloudMode("Signed in, but couldn't reach the server to load your characters ("+(e&&e.message?e.message:"see console for details")+"). You're back to this device's local characters for now.");
   }
 }
 
