@@ -3098,7 +3098,7 @@ async function cloudLoadCharacterData(id){
   try{
     const { data, error } = await supabaseClient.from("characters").select("data").eq("id", id).single();
     if(error || !data) return structuredClone(DEFAULT_STATE);
-    return migrateArmor(migrateRace(migrateAttacks(Object.assign(structuredClone(DEFAULT_STATE), data.data))));
+    return migrateArmor(data.data, migrateRace(migrateAttacks(Object.assign(structuredClone(DEFAULT_STATE), data.data))));
   }catch(e){ return structuredClone(DEFAULT_STATE); }
 }
 
