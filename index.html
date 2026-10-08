@@ -3252,6 +3252,7 @@ function renderAuthBar(){
     authUser = null;
     activeCharacterCampaignIds = [];
     activeCharacterLevelUps = [];
+    teardownOwnLevelUpSub();
     roster = loadRoster();
     state = loadState();
     renderAuthBar();
@@ -3629,12 +3630,12 @@ async function loadCampaignDetailData(id){
   render();
   try{
     const { data: campaign, error: cErr } = await supabaseClient.from("campaigns")
-      .select("id,name,dm_user_id,level_up_mode,created_at").eq("id", id).single();
+      .select("id,name,dm_user_id,level_up_mode,dm_rest_control,created_at").eq("id", id).single();
     if(cErr || !campaign) throw (cErr || new Error("That campaign doesn't exist, or you don't have access to it."));
     const isDm = campaign.dm_user_id === authUser.id;
 
     const { data: members, error: mErr } = await supabaseClient.from("campaign_members")
-      .select("id,user_id,character_id,pending_level_up,joined_at")
+      .select("id,user_id,character_id,pending_level_up,pending_rest,joined_at")
       .eq("campaign_id", id).order("joined_at",{ascending:true});
     if(mErr) throw mErr;
 
@@ -3711,7 +3712,7 @@ async function refreshActiveCharacterCampaignLinks(){
   }
   try{
     const { data, error } = await supabaseClient.from("campaign_members")
-      .select("campaign_id, pending_level_up, campaigns(level_up_mode)")
+      .select("campaign_id, pending_level_up, pending_rest, campaigns(level_up_mode)")
       .eq("user_id", authUser.id).eq("character_id", roster.activeId);
     if(error || !data){
       activeCharacterCampaignIds = [];
@@ -3723,6 +3724,10 @@ async function refreshActiveCharacterCampaignLinks(){
         pending: !!r.pending_level_up,
         mode: (r.campaigns && r.campaigns.level_up_mode) || "dm_only"
       }));
+      // A rest the DM triggered while this character wasn't even loaded (app closed, different
+      // character active, etc.) is still sitting on the row — apply it now rather than only on
+      // the next live update, same reasoning as the level-up cache just above.
+      data.forEach(r=>{ if(r.pending_rest) applyRemoteRest(r.campaign_id, r.pending_rest); });
     }
   }catch(e){
     activeCharacterCampaignIds = [];
@@ -3733,6 +3738,59 @@ async function refreshActiveCharacterCampaignLinks(){
   // (and any newly-linked campaign for the roll log) rather than waiting for some unrelated
   // render to happen to show it.
   if(currentView==="sheet") renderPreserveScroll();
+  subscribeToOwnLevelUps();
+}
+
+// --- DM-triggered rests: the DM sets campaign_members.pending_rest on a player's row; the
+// player's own client (via the realtime subscription below, or on next load) applies the rest
+// locally with performShortRest/performLongRest — exactly the same code their own Short/Long
+// Rest buttons run — then clears the flag back to null. The DM never touches the player's HP,
+// slots, etc. directly; they only ever flip this one flag, same pattern as pending_level_up.
+async function applyRemoteRest(campaignId, kind){
+  if(kind==="short") performShortRest({ triggeredByDm:true });
+  else if(kind==="long") performLongRest({ triggeredByDm:true });
+  else return;
+  clearPendingRest(campaignId);
+}
+async function clearPendingRest(campaignId){
+  try{
+    await supabaseClient.from("campaign_members")
+      .update({ pending_rest: null }).eq("campaign_id", campaignId).eq("user_id", authUser.id);
+  }catch(e){
+    console.warn("Couldn't clear pending_rest:", e);
+  }
+}
+
+// Live level-up notifications: without this, a player who already has the sheet open when the
+// DM clicks "Grant Level-Up" wouldn't see the banner until they switched characters or reloaded
+// — the cache above only refreshes on specific triggers, not continuously. One Realtime
+// subscription (filtered to this user's own campaign_members rows — RLS backs this up too, so
+// it could never receive anyone else's) picks up that change the instant it happens. Needs
+// `campaign_members` added to the supabase_realtime publication — see
+// campaign_members_realtime_migration.sql.
+let ownLevelUpSub = null;
+function subscribeToOwnLevelUps(){
+  teardownOwnLevelUpSub();
+  if(!isCloudMode() || !supabaseClient) return;
+  ownLevelUpSub = supabaseClient.channel("own-level-ups-"+authUser.id)
+    .on("postgres_changes", { event:"UPDATE", schema:"public", table:"campaign_members", filter:"user_id=eq."+authUser.id }, (payload)=>{
+      const row = payload.new;
+      // Only matters if it's about the character currently on screen — a player could in theory
+      // have a different character linked into a different campaign in the background.
+      if(!row || row.character_id !== roster.activeId) return;
+      const rec = activeCharacterLevelUps.find(x=>x.campaignId===row.campaign_id);
+      if(rec) rec.pending = !!row.pending_level_up;
+      else activeCharacterLevelUps.push({ campaignId: row.campaign_id, pending: !!row.pending_level_up, mode:"dm_only" });
+      if(row.pending_rest) applyRemoteRest(row.campaign_id, row.pending_rest);
+      if(currentView==="sheet") renderPreserveScroll();
+    })
+    .subscribe();
+}
+function teardownOwnLevelUpSub(){
+  if(ownLevelUpSub){
+    try{ supabaseClient.removeChannel(ownLevelUpSub); }catch(e){}
+    ownLevelUpSub = null;
+  }
 }
 
 // Tells renderLevelUpBanner() what, if anything, to show for the currently active character:
@@ -3835,6 +3893,18 @@ async function updateLevelUpMode(campaignId, mode){
   }
 }
 
+async function updateDmRestControl(campaignId, enabled){
+  try{
+    const { error } = await supabaseClient.from("campaigns").update({ dm_rest_control: enabled }).eq("id", campaignId);
+    if(error) throw error;
+    if(campaignDetailData) campaignDetailData.campaign.dm_rest_control = enabled;
+    renderPreserveScroll();
+  }catch(e){
+    showToast("Couldn't update that setting ("+(e&&e.message?e.message:"connection error")+").");
+    renderPreserveScroll();
+  }
+}
+
 async function copyInviteLink(campaignId){
   try{
     const { data, error } = await supabaseClient.from("campaign_invites")
@@ -3878,6 +3948,25 @@ async function toggleMemberLevelUp(campaignId, userId, value){
     showToast(value ? "Level-up granted." : "Level-up flag cleared.");
   }catch(e){
     showToast("Couldn't update that ("+(e&&e.message?e.message:"connection error")+").");
+  }
+  campaignActionBusy = false;
+  renderPreserveScroll();
+}
+
+async function triggerRemoteRest(campaignId, userId, kind){
+  if(campaignActionBusy) return;
+  campaignActionBusy = true;
+  try{
+    const { error } = await supabaseClient.from("campaign_members")
+      .update({ pending_rest: kind }).eq("campaign_id", campaignId).eq("user_id", userId);
+    if(error) throw error;
+    if(campaignDetailData){
+      const m = campaignDetailData.members.find(x=>x.user_id===userId);
+      if(m) m.pending_rest = kind;
+    }
+    showToast((kind==="long"?"Long":"Short")+" Rest triggered — it'll apply the moment their sheet is open.");
+  }catch(e){
+    showToast("Couldn't trigger that rest ("+(e&&e.message?e.message:"connection error")+").");
   }
   campaignActionBusy = false;
   renderPreserveScroll();
@@ -3958,6 +4047,12 @@ function renderCampaignSettingsCard(campaign, isDm){
           <option value="both" ${campaign.level_up_mode==="both"?"selected":""}>Either</option>
         </select>
       </div>
+      <div class="item-box" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+        <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+          <input type="checkbox" id="campaign-dm-rest-control" ${campaign.dm_rest_control?"checked":""}>
+          <span>Let me trigger Short/Long Rest for players remotely</span>
+        </label>
+      </div>
       <div class="toolbar">
         <button class="small" id="btn-copy-invite-link">&#128279; Copy Invite Link</button>
       </div>
@@ -3973,7 +4068,11 @@ function renderCampaignMembersCard(members, charsById, isDm, campaign){
     const label = charName ? escapeHtml(charName) : `<span class="small-label">No character linked</span>`;
     const youTag = isYou ? ' <span class="small-label">(you)</span>' : '';
     const pendingBadge = m.pending_level_up ? `<span class="small-label" style="color:var(--brass-light);">&#9733; Level-up ready</span>` : "";
+    const pendingRestBadge = m.pending_rest ? `<span class="small-label" style="color:var(--brass-light);">&#8987; Rest pending</span>` : "";
     const dmControls = isDm ? `<button class="ghost small" data-grant-levelup="${m.user_id}" data-value="${m.pending_level_up?"false":"true"}">${m.pending_level_up?"Clear Level-Up":"Grant Level-Up"}</button>` : "";
+    const dmRestControls = (isDm && campaign.dm_rest_control && charName) ? `
+        <button class="ghost small" data-trigger-rest="${m.user_id}" data-rest-kind="short" ${m.pending_rest?"disabled":""}>Short Rest</button>
+        <button class="ghost small" data-trigger-rest="${m.user_id}" data-rest-kind="long" ${m.pending_rest?"disabled":""}>Long Rest</button>` : "";
     const linkPicker = (isYou && !charName && roster.index.length) ? `
       <div style="display:flex;gap:6px;align-items:center;">
         <select data-link-character-select="${m.id}" style="width:auto;">
@@ -3982,8 +4081,8 @@ function renderCampaignMembersCard(members, charsById, isDm, campaign){
         </select>
       </div>` : "";
     return `<div class="item-box campaign-row">
-      <div>${label}${youTag} ${pendingBadge}</div>
-      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">${linkPicker}${dmControls}</div>
+      <div>${label}${youTag} ${pendingBadge} ${pendingRestBadge}</div>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">${linkPicker}${dmControls}${dmRestControls}</div>
     </div>`;
   }).join("");
   return `<div class="card open">
@@ -4188,10 +4287,15 @@ function wireCampaignPageEvents(){
     const { campaign, isDm } = campaignDetailData;
     const modeSelect = document.getElementById("campaign-level-up-mode");
     if(modeSelect) modeSelect.addEventListener("change", ()=>updateLevelUpMode(campaign.id, modeSelect.value));
+    const restControlToggle = document.getElementById("campaign-dm-rest-control");
+    if(restControlToggle) restControlToggle.addEventListener("change", ()=>updateDmRestControl(campaign.id, restControlToggle.checked));
     const copyLinkBtn = document.getElementById("btn-copy-invite-link");
     if(copyLinkBtn) copyLinkBtn.addEventListener("click", ()=>copyInviteLink(campaign.id));
     document.querySelectorAll("[data-grant-levelup]").forEach(el=>{
       el.addEventListener("click", ()=>toggleMemberLevelUp(campaign.id, el.getAttribute("data-grant-levelup"), el.getAttribute("data-value")==="true"));
+    });
+    document.querySelectorAll("[data-trigger-rest]").forEach(el=>{
+      el.addEventListener("click", ()=>triggerRemoteRest(campaign.id, el.getAttribute("data-trigger-rest"), el.getAttribute("data-rest-kind")));
     });
     document.querySelectorAll("[data-link-character-select]").forEach(el=>{
       el.addEventListener("change", ()=>linkCharacterToCampaign(el.getAttribute("data-link-character-select"), el.value));
@@ -4215,8 +4319,25 @@ function wireCampaignPageEvents(){
     document.querySelectorAll("[data-delete-note]").forEach(el=>{
       el.addEventListener("click", ()=>deleteNote(campaign.id, el.getAttribute("data-delete-note")));
     });
+    // Keep noteModalState in sync with every keystroke/change, not just at Save time — without
+    // this, any re-render while the modal is open (the DM's live roll log updating in the
+    // background, say, or the "give it a title" validation error re-rendering the same modal)
+    // rebuilds the title/body/visibility fields from the stale state they had when the modal
+    // first opened, silently erasing whatever had been typed since.
+    const noteTitleInput = document.getElementById("note-title-input");
+    if(noteTitleInput) noteTitleInput.addEventListener("input", ()=>{ noteModalState.title = noteTitleInput.value; });
+    const noteBodyInput = document.getElementById("note-body-input");
+    if(noteBodyInput) noteBodyInput.addEventListener("input", ()=>{ noteModalState.body = noteBodyInput.value; });
+    document.querySelectorAll(".note-visible-to").forEach(cb=>{
+      cb.addEventListener("change", ()=>{
+        const v = cb.value;
+        if(cb.checked){ if(!noteModalState.visibleTo.includes(v)) noteModalState.visibleTo.push(v); }
+        else { noteModalState.visibleTo = noteModalState.visibleTo.filter(x=>x!==v); }
+      });
+    });
     const visSelect = document.getElementById("note-visibility-select");
     if(visSelect) visSelect.addEventListener("change", ()=>{
+      noteModalState.visibility = visSelect.value;
       const panel = document.getElementById("note-specific-players");
       if(panel) panel.style.display = (visSelect.value==="specific") ? "" : "none";
     });
@@ -6520,6 +6641,7 @@ function applyHpDelta(delta){
 }
 
 function rollAttackAndShow(atkIdx){
+  if(diceRollLocked) return; // a roll is already spinning — ignore the click instead of quietly re-rolling behind it
   const a = state.attacks[atkIdx];
   if(!a) return;
   const advMode = state.diceRoller.advantageMode || "normal";
@@ -6580,19 +6702,23 @@ function rollAttackAndShow(atkIdx){
     }
   }
 
-  state.diceRoller.attackResult = {name, toHit, damage:{lines:damageLines, total:damageTotal}, gwfNote, masteryNote};
-  saveState(); renderPreserveScroll();
   // The to-hit roll is always a d20; damage dice are usually a different size, so an attack
   // only gets a die-specific shape in the rare case every damage die happens to match (d20 too).
   const attackFaces = new Set([20, ...damageLines.map(d=>d.die)]);
   const attackDieFace = attackFaces.size===1 ? 20 : null;
+  // Same deliberate hold as Roll All above: state.diceRoller.attackResult (and its render) don't
+  // land until onReveal fires, so the to-hit/damage readout can't spoil the result mid-spin.
   triggerDiceFx({
     total: toHit.isNat1 ? toHit.total : (damageTotal || toHit.total),
     label: toHit.isNat20 ? "Critical Hit!" : (toHit.isNat1 ? "Critical Miss!" : name),
     breakdown: toHit.isNat1 ? `To Hit: ${toHit.roll} + ${fmt(atkBonus)} = ${toHit.total}` : `To Hit: ${toHit.total}  •  Damage: ${damageTotal}`,
     isCrit: toHit.isNat20,
     isFail: toHit.isNat1,
-    dieFace: attackDieFace
+    dieFace: attackDieFace,
+    onReveal: ()=>{
+      state.diceRoller.attackResult = {name, toHit, damage:{lines:damageLines, total:damageTotal}, gwfNote, masteryNote};
+      saveState(); renderPreserveScroll();
+    }
   });
 }
 
@@ -6661,12 +6787,25 @@ function dieShapeInfo(dieFace){
 // icon and the result card's outline to match the die actually rolled, in the current theme's
 // colors; omit it (or pass a mixed roll's null) to fall back to the plain emoji + square card.
 let diceFxDismissTimer = null;
-function triggerDiceFx({total, label, breakdown, isCrit, isFail, dieFace}){
-  // Fire-and-forget: streams this roll to the DM's live roll log if this character is linked
-  // into a campaign, but never delays or blocks the roll animation/sound itself.
-  logRollToCampaigns({total, label, breakdown, isCrit, isFail});
+// True for exactly the 2-second spin of the most recent roll — every roll trigger (Roll All,
+// an attack, Quick d20) checks this FIRST and bails out before touching any state if a roll is
+// already spinning, so mashing the button can't quietly recompute/overwrite a result behind the
+// animation's back. The overlay itself also can't be click-dismissed until the spin is actually
+// done, closing the other way someone could skip past it. Cleared the moment the spin ends —
+// the result card lingering afterward doesn't keep the next roll locked out.
+let diceRollLocked = false;
+// `onReveal`, if given, fires at the exact moment the spin ends and the number becomes visible
+// (same instant as `diceRollLocked` clearing below) — never earlier. Callers use it to commit the
+// roll into whatever state drives their own on-page display (the Dice Roller card's Result box,
+// an attack's to-hit/damage readout, the campaign roll log) so nothing on screen reveals the
+// outcome ahead of the animation. Nothing about `total`/`label`/etc. above leaks early either —
+// they only ever reach the DOM inside the overlay's own innerHTML, which stays display:none via
+// CSS until the reveal.
+function triggerDiceFx({total, label, breakdown, isCrit, isFail, dieFace, onReveal}){
+  if(diceRollLocked) return;
   const overlay = document.getElementById("dice-fx-overlay");
-  if(!overlay) return;
+  if(!overlay){ if(typeof onReveal==="function") onReveal(); return; }
+  diceRollLocked = true;
   clearTimeout(diceFxDismissTimer);
   const shape = dieShapeInfo(dieFace);
   const shapeStyle = shape ? `clip-path:${shape.clip||"none"};${shape.circle?"border-radius:50%;":(shape.clip?"border-radius:0;":"")}` : "";
@@ -6687,8 +6826,10 @@ function triggerDiceFx({total, label, breakdown, isCrit, isFail, dieFace}){
   resultEl.classList.toggle("crit", !!isCrit);
   resultEl.classList.toggle("fail", !!isFail);
   overlay.classList.add("show");
-  const dismiss = ()=>{ overlay.classList.remove("show"); overlay.innerHTML = ""; };
-  overlay.onclick = dismiss;
+  const dismiss = ()=>{ overlay.classList.remove("show"); overlay.innerHTML = ""; overlay.onclick = null; };
+  // Deliberately NOT click-dismissable yet — that was the other way someone could skip past the
+  // spin early. It becomes clickable again once the spin finishes, below.
+  overlay.onclick = null;
   // The dice spin always runs its full 2 seconds — this is a personal tool for one table, not
   // a public page, so there's no reason to let an OS-level "reduce motion" setting silently cut
   // the roll short. (It still trims the subtler result-pop animation via the CSS media query
@@ -6702,6 +6843,13 @@ function triggerDiceFx({total, label, breakdown, isCrit, isFail, dieFace}){
       r.classList.add("show");
       if(isCrit) playCritFanfare(); else if(isFail) playFailThud();
     }
+    overlay.onclick = dismiss; // the mandatory wait is over — happy to be dismissed early now
+    diceRollLocked = false; // ...and the next roll may begin
+    // Fire-and-forget: streams this roll to the DM's live roll log if this character is linked
+    // into a campaign. Deliberately held until right here (not back at trigger time) so the DM's
+    // feed can't tip anyone off to the result before the roller's own screen reveals it either.
+    logRollToCampaigns({total, label, breakdown, isCrit, isFail});
+    if(typeof onReveal === "function") onReveal();
   }, spinDuration);
   diceFxDismissTimer = setTimeout(dismiss, spinDuration + 2200);
 }
@@ -9143,6 +9291,86 @@ function wireImageHandling(){
   }
 }
 
+// Short/Long Rest are each one shared function now, not inline click-handler bodies — the DM's
+// remote "trigger a rest for this player" button (campaign detail page) calls the exact same
+// code a player's own Short Rest/Long Rest button does, so the two can never quietly drift out
+// of sync with each other. `opts.triggeredByDm` only changes the toast wording.
+function performShortRest(opts){
+  opts = opts || {};
+  if(state.isDead){ showToast("This character is deceased — resting doesn't restore anything. Revive them first (top of the sheet) if that was a mistake."); return; }
+  let restored = [];
+  if((state.pactSlotsUsed||0) > 0 && state.classes.some(c=>c.cls==="Warlock")){ restored.push("Pact Magic slots"); }
+  state.pactSlotsUsed = 0;
+  if((state.superiorityDiceUsed||0) > 0 && state.classes.some(c=>c.cls==="Fighter" && c.subclass==="Battle Master")){ restored.push("Superiority Dice"); }
+  state.superiorityDiceUsed = 0;
+  if((state.kiUsed||0) > 0 && state.classes.some(c=>c.cls==="Monk")){ restored.push("Focus Points"); }
+  state.kiUsed = 0;
+  saveState(); renderPreserveScroll();
+  playRestChime();
+  const prefix = opts.triggeredByDm ? "Your DM triggered a Short Rest for you — " : "Short Rest complete — ";
+  showToast(restored.length ? `${prefix}restored: ${restored.join(", ")}.` : `${prefix}nothing to restore beyond that (spend Hit Dice manually if you want to heal).`);
+}
+
+function performLongRest(opts){
+  opts = opts || {};
+  if(state.isDead){ showToast("This character is deceased — resting doesn't restore anything. Revive them first (top of the sheet) if that was a mistake."); return; }
+  const restored = [];
+  if(state.hp.current < autoMaxHP()){ restored.push("HP to full"); }
+  state.hp.current = autoMaxHP();
+  if((state.hp.temp||0) > 0){ restored.push("removed Temp HP"); }
+  state.hp.temp = 0;
+
+  const hadSlotsUsed = Object.values(state.spellSlotsUsed||{}).some(n=>n>0) || (state.pactSlotsUsed||0)>0;
+  if(hadSlotsUsed) restored.push("spell slots");
+  state.spellSlotsUsed = {1:0,2:0,3:0,4:0,5:0,6:0,7:0,8:0,9:0};
+  state.pactSlotsUsed = 0;
+
+  const totalHitDice = totalLevel();
+  const regain = Math.max(1, Math.floor(totalHitDice/2));
+  if((state.hitDiceUsed||0) > 0){ restored.push("some Hit Dice"); }
+  state.hitDiceUsed = Math.max(0, (state.hitDiceUsed||0) - regain);
+
+  if((parseInt(state.exhaustion)||0) > 0){
+    state.exhaustion = Math.max(0, (parseInt(state.exhaustion)||0) - 1);
+    restored.push("1 level of Exhaustion");
+  }
+
+  const hadConditions = state.conditions && Object.values(state.conditions).some(Boolean);
+  if(hadConditions) restored.push("conditions");
+  state.conditions = {};
+
+  if(state.deathSaves.success>0 || state.deathSaves.fail>0){ restored.push("death saves"); }
+  state.deathSaves = {success:0, fail:0};
+
+  const activeEffects = (state.classEffects||[]).filter(e=>e.active);
+  if(activeEffects.length){ restored.push(`toggled off: ${activeEffects.map(e=>e.name||"a feature").join(", ")}`); }
+  (state.classEffects||[]).forEach(e=>{ e.active = false; });
+
+  if(state.concentration && state.concentration.active){ restored.push("ended concentration"); }
+  state.concentration = {active:false, label:"", isCustom:false};
+
+  const usedArcanum = Object.values(state.mysticArcanum||{}).filter(a=>a.used);
+  if(usedArcanum.length && state.classes.some(c=>c.cls==="Warlock")){ restored.push("Mystic Arcanum"); }
+  Object.values(state.mysticArcanum||{}).forEach(a=>{ a.used = false; });
+
+  if((state.superiorityDiceUsed||0) > 0 && state.classes.some(c=>c.cls==="Fighter" && c.subclass==="Battle Master")){ restored.push("Superiority Dice"); }
+  state.superiorityDiceUsed = 0;
+
+  if((state.kiUsed||0) > 0 && state.classes.some(c=>c.cls==="Monk")){ restored.push("Focus Points"); }
+  state.kiUsed = 0;
+
+  if(Object.values(state.featSpellUses||{}).some(Boolean)){ restored.push("feat spell free casts"); }
+  state.featSpellUses = {};
+
+  if((state.luckPointsUsed||0) > 0 && allChosenFeats().some(f=>f.feat==="Lucky")){ restored.push("Luck Points"); }
+  state.luckPointsUsed = 0;
+
+  saveState(); renderPreserveScroll();
+  playRestChime();
+  const prefix = opts.triggeredByDm ? "Your DM triggered a Long Rest for you — " : "Long Rest complete — ";
+  showToast(restored.length ? `${prefix}restored: ${restored.join("; ")}.` : `${prefix}you were already fully rested.`);
+}
+
 function wireEvents(){
   app.querySelectorAll("[data-toggle]").forEach(el=>{
     el.addEventListener("click", ()=>{
@@ -9462,6 +9690,7 @@ function wireEvents(){
   });
   const rollDiceBtn = document.getElementById("btn-roll-dice");
   if(rollDiceBtn) rollDiceBtn.addEventListener("click", ()=>{
+    if(diceRollLocked) return; // a roll is already spinning — ignore the click instead of quietly re-rolling behind it
     const included = state.diceRoller.pool.filter(d=>d.included!==false);
     if(!included.length){
       showToast("No dice are toggled to include right now — check 'include' on at least one line first.");
@@ -9500,21 +9729,26 @@ function wireEvents(){
     }
     const modifier = computeRollModifier();
     if(modifier) grandTotal += modifier.value;
-    state.diceRoller.results = {rolls, total:grandTotal, modifier};
-    saveState(); renderPreserveScroll();
     const anyNat20 = rolls.some(r=>r.isNat20);
     const anyNat1 = !anyNat20 && rolls.some(r=>r.isNat1);
     // Only show a die-specific shape when every rolled die is the same size — a pool mixing,
     // say, a d6 and a d8 has no single face to represent, so it falls back to the default look.
     const rolledFaces = new Set(rolls.map(r=>r.die));
     const rollDieFace = rolledFaces.size===1 ? [...rolledFaces][0] : null;
+    // Deliberately NOT written to state.diceRoller.results (and no render) until the spin
+    // finishes — see triggerDiceFx's onReveal — so the Result box on this card can't show the
+    // number out from under the still-playing animation.
     triggerDiceFx({
       total: grandTotal,
       label: anyNat20 ? "Natural 20!" : (anyNat1 ? "Natural 1…" : null),
       breakdown: rolls.map(r=>`${r.count}d${r.die}: ${r.subtotal}`).join(" + ") + (modifier?` + ${modifier.label} (${fmt(modifier.value)})`:""),
       isCrit: anyNat20,
       isFail: anyNat1,
-      dieFace: rollDieFace
+      dieFace: rollDieFace,
+      onReveal: ()=>{
+        state.diceRoller.results = {rolls, total:grandTotal, modifier};
+        saveState(); renderPreserveScroll();
+      }
     });
   });
   app.querySelectorAll("[data-dice-advmode]").forEach(el=>{
@@ -9644,6 +9878,7 @@ function wireEvents(){
 
   const quickD20Btn = document.getElementById("btn-quick-d20");
   if(quickD20Btn) quickD20Btn.addEventListener("click", ()=>{
+    if(diceRollLocked) return; // a roll is already spinning — ignore the click instead of quietly re-rolling behind it
     // A plain d20 with nothing added — no ability score, no proficiency, no Dice Roller modifier.
     // Doesn't touch state.diceRoller at all, so it can't clobber whatever the Dice Roller card
     // has set up; it just fires the same spin/sound/shape flourish as any other roll.
@@ -9659,76 +9894,10 @@ function wireEvents(){
   });
 
   const shortRestBtn = document.getElementById("btn-short-rest");
-  if(shortRestBtn) shortRestBtn.addEventListener("click", ()=>{
-    let restored = [];
-    if((state.pactSlotsUsed||0) > 0 && state.classes.some(c=>c.cls==="Warlock")){ restored.push("Pact Magic slots"); }
-    state.pactSlotsUsed = 0;
-    if((state.superiorityDiceUsed||0) > 0 && state.classes.some(c=>c.cls==="Fighter" && c.subclass==="Battle Master")){ restored.push("Superiority Dice"); }
-    state.superiorityDiceUsed = 0;
-    if((state.kiUsed||0) > 0 && state.classes.some(c=>c.cls==="Monk")){ restored.push("Focus Points"); }
-    state.kiUsed = 0;
-    saveState(); renderPreserveScroll();
-    playRestChime();
-    showToast(restored.length ? `Short Rest complete — restored: ${restored.join(", ")}.` : "Short Rest complete — nothing to restore beyond that (spend Hit Dice manually if you want to heal).");
-  });
+  if(shortRestBtn) shortRestBtn.addEventListener("click", ()=>performShortRest());
 
   const longRestBtn = document.getElementById("btn-long-rest");
-  if(longRestBtn) longRestBtn.addEventListener("click", ()=>{
-    const restored = [];
-    if(state.hp.current < autoMaxHP()){ restored.push("HP to full"); }
-    state.hp.current = autoMaxHP();
-    if((state.hp.temp||0) > 0){ restored.push("removed Temp HP"); }
-    state.hp.temp = 0;
-
-    const hadSlotsUsed = Object.values(state.spellSlotsUsed||{}).some(n=>n>0) || (state.pactSlotsUsed||0)>0;
-    if(hadSlotsUsed) restored.push("spell slots");
-    state.spellSlotsUsed = {1:0,2:0,3:0,4:0,5:0,6:0,7:0,8:0,9:0};
-    state.pactSlotsUsed = 0;
-
-    const totalHitDice = totalLevel();
-    const regain = Math.max(1, Math.floor(totalHitDice/2));
-    if((state.hitDiceUsed||0) > 0){ restored.push("some Hit Dice"); }
-    state.hitDiceUsed = Math.max(0, (state.hitDiceUsed||0) - regain);
-
-    if((parseInt(state.exhaustion)||0) > 0){
-      state.exhaustion = Math.max(0, (parseInt(state.exhaustion)||0) - 1);
-      restored.push("1 level of Exhaustion");
-    }
-
-    const hadConditions = state.conditions && Object.values(state.conditions).some(Boolean);
-    if(hadConditions) restored.push("conditions");
-    state.conditions = {};
-
-    if(state.deathSaves.success>0 || state.deathSaves.fail>0){ restored.push("death saves"); }
-    state.deathSaves = {success:0, fail:0};
-
-    const activeEffects = (state.classEffects||[]).filter(e=>e.active);
-    if(activeEffects.length){ restored.push(`toggled off: ${activeEffects.map(e=>e.name||"a feature").join(", ")}`); }
-    (state.classEffects||[]).forEach(e=>{ e.active = false; });
-
-    if(state.concentration && state.concentration.active){ restored.push("ended concentration"); }
-    state.concentration = {active:false, label:"", isCustom:false};
-
-    const usedArcanum = Object.values(state.mysticArcanum||{}).filter(a=>a.used);
-    if(usedArcanum.length && state.classes.some(c=>c.cls==="Warlock")){ restored.push("Mystic Arcanum"); }
-    Object.values(state.mysticArcanum||{}).forEach(a=>{ a.used = false; });
-
-    if((state.superiorityDiceUsed||0) > 0 && state.classes.some(c=>c.cls==="Fighter" && c.subclass==="Battle Master")){ restored.push("Superiority Dice"); }
-    state.superiorityDiceUsed = 0;
-
-    if((state.kiUsed||0) > 0 && state.classes.some(c=>c.cls==="Monk")){ restored.push("Focus Points"); }
-    state.kiUsed = 0;
-
-    if(Object.values(state.featSpellUses||{}).some(Boolean)){ restored.push("feat spell free casts"); }
-    state.featSpellUses = {};
-
-    if((state.luckPointsUsed||0) > 0 && allChosenFeats().some(f=>f.feat==="Lucky")){ restored.push("Luck Points"); }
-    state.luckPointsUsed = 0;
-
-    saveState(); renderPreserveScroll();
-    playRestChime();
-    showToast(restored.length ? `Long Rest complete — restored: ${restored.join("; ")}.` : "Long Rest complete — you were already fully rested.");
-  });
+  if(longRestBtn) longRestBtn.addEventListener("click", ()=>performLongRest());
 
   const toggleDeadBtn = document.getElementById("btn-toggle-dead");
   if(toggleDeadBtn) toggleDeadBtn.addEventListener("click", ()=>{
