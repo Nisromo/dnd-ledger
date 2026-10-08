@@ -430,6 +430,17 @@
   .auth-modal .auth-switch a{ color:var(--brass-light); cursor:pointer; text-decoration:underline; }
   .auth-modal.wide{ max-width:440px; }
   .auth-modal textarea{ width:100%; margin-bottom:8px; font-family:inherit; resize:vertical; }
+  /* .auth-modal input{width:100%} above is meant for text inputs — without this override it also
+     stretches a plain checkbox to fill the row, squeezing its label tight against it. */
+  .auth-modal input[type="checkbox"]{ width:16px; flex:0 0 auto; margin:0; }
+  .note-visible-row{ display:flex; align-items:center; gap:10px; font-size:13px; padding:8px 4px; }
+  .note-visible-row:not(:last-child){ border-bottom:1px solid var(--line); }
+  /* A checkbox label that's the lone child of a flex .item-box sizes to fit its own (possibly
+     wrapped) content rather than the box's full width, so once the text wraps to two lines the
+     whole row shrinks down to that wrapped width — leaving dead space beside it and making a
+     full-width toggle look squeezed into a narrow column. width:100% gives the text the entire
+     row to lay out in before it ever needs to wrap. */
+  .campaign-toggle-label{ display:flex; align-items:center; gap:10px; width:100%; cursor:pointer; }
   .campaign-row{ display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap; }
   .campaign-row + .campaign-row{ margin-top:8px; }
   .note-box{ margin-bottom:10px; }
@@ -3176,7 +3187,7 @@ function addNewCharacterSheet(){
       roster.index.push({id:newId, name:""});
       roster.activeId = newId;
       state = newState;
-      activeCharacterCampaignIds = []; activeCharacterLevelUps = []; // a brand-new character can't be linked into a campaign yet
+      activeCharacterCampaignIds = []; activeCharacterLevelUps = []; activeCharacterCampaignFlags = []; // a brand-new character can't be linked into a campaign yet
       render();
       showToast("New blank character sheet created in your account — your other characters are still saved.");
     });
@@ -3204,7 +3215,7 @@ function deleteCharacterSheet(id){
         roster.index.push({id:newId, name:""});
         roster.activeId = newId;
         state = newState;
-        activeCharacterCampaignIds = []; activeCharacterLevelUps = [];
+        activeCharacterCampaignIds = []; activeCharacterLevelUps = []; activeCharacterCampaignFlags = [];
         render();
       });
     } else {
@@ -3278,6 +3289,7 @@ function renderAuthBar(){
     authUser = null;
     activeCharacterCampaignIds = [];
     activeCharacterLevelUps = [];
+    activeCharacterCampaignFlags = [];
     teardownOwnLevelUpSub();
     roster = loadRoster();
     state = loadState();
@@ -3652,7 +3664,7 @@ async function loadCampaignDetailData(id){
   render();
   try{
     const { data: campaign, error: cErr } = await supabaseClient.from("campaigns")
-      .select("id,name,dm_user_id,level_up_mode,dm_rest_control,created_at").eq("id", id).single();
+      .select("id,name,dm_user_id,level_up_mode,dm_rest_control,dm_levelup_lock,created_at").eq("id", id).single();
     if(cErr || !campaign) throw (cErr || new Error("That campaign doesn't exist, or you don't have access to it."));
     const isDm = campaign.dm_user_id === authUser.id;
 
@@ -3664,7 +3676,8 @@ async function loadCampaignDetailData(id){
     const charIds = (members||[]).map(m=>m.character_id).filter(Boolean);
     const charsById = {};
     if(charIds.length){
-      const { data: chars } = await supabaseClient.from("characters").select("id,name").in("id", charIds);
+      const { data: chars } = await supabaseClient.from("characters")
+        .select("id,name,raceBonus:data->>raceBonus,customRace:data->>customRace").in("id", charIds);
       (chars||[]).forEach(c=>{ charsById[c.id] = c; });
     }
 
@@ -3676,8 +3689,8 @@ async function loadCampaignDetailData(id){
     let rolls = [];
     if(isDm){
       const { data: rollRows } = await supabaseClient.from("campaign_roll_log")
-        .select("id,user_id,character_name,roll_label,total,is_crit,is_fail,created_at")
-        .eq("campaign_id", id).order("created_at",{ascending:false}).limit(50);
+        .select("id,user_id,character_name,roll_label,roll_kind,breakdown,total,is_crit,is_fail,created_at")
+        .eq("campaign_id", id).order("created_at",{ascending:false}).limit(10);
       rolls = rollRows || [];
     }
 
@@ -3701,7 +3714,7 @@ function subscribeToCampaignRolls(campaignId, isDm){
   campaignRollSub = supabaseClient.channel("campaign-rolls-"+campaignId)
     .on("postgres_changes", { event:"INSERT", schema:"public", table:"campaign_roll_log", filter:"campaign_id=eq."+campaignId }, (payload)=>{
       if(!campaignDetailData || !campaignDetailData.campaign || campaignDetailData.campaign.id !== campaignId) return;
-      campaignDetailData.rolls = [payload.new, ...campaignDetailData.rolls].slice(0,50);
+      campaignDetailData.rolls = [payload.new, ...campaignDetailData.rolls].slice(0,10);
       renderPreserveScroll();
     })
     .subscribe();
@@ -3725,26 +3738,38 @@ let activeCharacterCampaignIds = [];
 // Parallel array: [{campaignId, pending, mode}] — this character's pending_level_up flag and
 // its campaign's level_up_mode, for every campaign it's linked into. Powers renderLevelUpBanner().
 let activeCharacterLevelUps = [];
+// Parallel array: [{campaignId, dmRestControl, dmLevelupLock}] — the two DM-side lock toggles for
+// every campaign this character is linked into. Powers restLockedByDm() and levelFieldLocked(),
+// which the masthead's Short/Long Rest buttons and the Classes & Features level inputs check
+// before letting the player act on their own.
+let activeCharacterCampaignFlags = [];
 
 async function refreshActiveCharacterCampaignLinks(){
   if(!isCloudMode() || !roster.activeId){
     activeCharacterCampaignIds = [];
     activeCharacterLevelUps = [];
+    activeCharacterCampaignFlags = [];
     return;
   }
   try{
     const { data, error } = await supabaseClient.from("campaign_members")
-      .select("campaign_id, pending_level_up, pending_rest, campaigns(level_up_mode)")
+      .select("campaign_id, pending_level_up, pending_rest, campaigns(level_up_mode, dm_rest_control, dm_levelup_lock)")
       .eq("user_id", authUser.id).eq("character_id", roster.activeId);
     if(error || !data){
       activeCharacterCampaignIds = [];
       activeCharacterLevelUps = [];
+      activeCharacterCampaignFlags = [];
     } else {
       activeCharacterCampaignIds = data.map(r=>r.campaign_id);
       activeCharacterLevelUps = data.map(r=>({
         campaignId: r.campaign_id,
         pending: !!r.pending_level_up,
         mode: (r.campaigns && r.campaigns.level_up_mode) || "dm_only"
+      }));
+      activeCharacterCampaignFlags = data.map(r=>({
+        campaignId: r.campaign_id,
+        dmRestControl: !!(r.campaigns && r.campaigns.dm_rest_control),
+        dmLevelupLock: !!(r.campaigns && r.campaigns.dm_levelup_lock)
       }));
       // A rest the DM triggered while this character wasn't even loaded (app closed, different
       // character active, etc.) is still sitting on the row — apply it now rather than only on
@@ -3754,6 +3779,7 @@ async function refreshActiveCharacterCampaignLinks(){
   }catch(e){
     activeCharacterCampaignIds = [];
     activeCharacterLevelUps = [];
+    activeCharacterCampaignFlags = [];
   }
   // Nothing awaits this function — it's kicked off fire-and-forget after sign-in, switching
   // characters, etc. — so once it actually resolves, re-render to pick up the level-up banner
@@ -3761,6 +3787,32 @@ async function refreshActiveCharacterCampaignLinks(){
   // render to happen to show it.
   if(currentView==="sheet") renderPreserveScroll();
   subscribeToOwnLevelUps();
+}
+
+// True if ANY campaign this character is linked into has the DM controlling rests — the
+// masthead's Short/Long Rest buttons are disabled (not hidden — see performShortRest/
+// performLongRest's own guard for the hard enforcement) whenever this is true, and the player
+// has to wait for the DM's remote trigger (triggerRemoteRest) instead.
+function restLockedByDm(){
+  return activeCharacterCampaignFlags.some(f=>f.dmRestControl);
+}
+
+// True if the character's class Level field(s) should be locked. Unlike the rest lock, leveling
+// up is a multi-step thing a player does by hand (bump the Level number, adjust HP, pick
+// features...), so a flat "pending flag only" lock would re-engage the instant they click "Take
+// Level Up" and before they'd actually touched their Level field — locking them out of applying
+// the very level-up they were just granted. So this unlocks in two cases: (1) there's a grant
+// sitting there waiting to be taken (pending===true), or (2) they just took one and haven't
+// actually bumped their class level yet (state.pendingLevelUpUnlock, set by takeLevelUp() below,
+// self-clears here the moment totalLevel() rises past the level they were at when they took it).
+function levelFieldLocked(){
+  const lockedCampaign = activeCharacterCampaignFlags.find(f=>f.dmLevelupLock);
+  if(!lockedCampaign) return false;
+  const lu = activeCharacterLevelUps.find(x=>x.campaignId===lockedCampaign.campaignId);
+  if(lu && lu.pending) return false;
+  const unlock = state.pendingLevelUpUnlock;
+  if(unlock && unlock.campaignId===lockedCampaign.campaignId && totalLevel()<=unlock.baselineLevel) return false;
+  return true;
 }
 
 // --- DM-triggered rests: the DM sets campaign_members.pending_rest on a player's row; the
@@ -3826,7 +3878,13 @@ function teardownOwnLevelUpSub(){
 function pendingLevelUpInfo(){
   const withPending = activeCharacterLevelUps.find(x=>x.pending);
   if(withPending) return { campaignId: withPending.campaignId, pending:true };
-  const selfGrantable = activeCharacterLevelUps.find(x=>!x.pending && (x.mode==="player_only" || x.mode==="both"));
+  // dm_levelup_lock overrides the Level-ups mode entirely — even a campaign set to "Players grant
+  // themselves"/"Either" won't offer the self-grant button while its DM has the lock switched on.
+  const selfGrantable = activeCharacterLevelUps.find(x=>{
+    if(x.pending || !(x.mode==="player_only" || x.mode==="both")) return false;
+    const flags = activeCharacterCampaignFlags.find(f=>f.campaignId===x.campaignId);
+    return !(flags && flags.dmLevelupLock);
+  });
   if(selfGrantable) return { campaignId: selfGrantable.campaignId, pending:false, selfGrantable:true };
   return null;
 }
@@ -3855,6 +3913,12 @@ async function takeLevelUp(){
     if(error) throw error;
     const rec = activeCharacterLevelUps.find(x=>x.campaignId===info.campaignId);
     if(rec) rec.pending = false;
+    // If this campaign hard-locks the Level field (see levelFieldLocked()), clearing `pending`
+    // above would otherwise re-lock it immediately — before the player has even touched their
+    // class Level. This latch keeps it unlocked until totalLevel() actually rises, at which point
+    // levelFieldLocked() stops honoring it and the lock re-engages on its own.
+    state.pendingLevelUpUnlock = { campaignId: info.campaignId, baselineLevel: totalLevel() };
+    saveState();
     showToast("Level up taken! Update your class level, HP, and features below — they're all yours to edit, as always.");
   }catch(e){
     showToast("Couldn't clear that ("+(e&&e.message?e.message:"connection error")+").");
@@ -3877,12 +3941,17 @@ async function selfGrantLevelUp(){
   renderPreserveScroll();
 }
 
-async function logRollToCampaigns({ total, label, breakdown, isCrit, isFail }){
+// rollKind categorizes WHAT the roll was for — "attack", "ability", "save", "skill", "tool", or
+// "normal" (Roll All with no modifier selected, or the plain Quick d20) — separate from roll_label,
+// which is just flavor text (a weapon's name, "Natural 20!", etc). Powers the little category
+// pill next to the player's name on the DM's Live Roll Log card.
+async function logRollToCampaigns({ total, label, breakdown, isCrit, isFail, rollKind }){
   if(!isCloudMode() || !activeCharacterCampaignIds.length) return;
   const row = {
     user_id: authUser.id,
     character_name: state.name || "Unnamed Adventurer",
     roll_label: label || "Roll",
+    roll_kind: rollKind || "normal",
     total: (typeof total === "number") ? total : null,
     breakdown: breakdown || "",
     is_crit: !!isCrit,
@@ -3920,6 +3989,18 @@ async function updateDmRestControl(campaignId, enabled){
     const { error } = await supabaseClient.from("campaigns").update({ dm_rest_control: enabled }).eq("id", campaignId);
     if(error) throw error;
     if(campaignDetailData) campaignDetailData.campaign.dm_rest_control = enabled;
+    renderPreserveScroll();
+  }catch(e){
+    showToast("Couldn't update that setting ("+(e&&e.message?e.message:"connection error")+").");
+    renderPreserveScroll();
+  }
+}
+
+async function updateDmLevelupLock(campaignId, enabled){
+  try{
+    const { error } = await supabaseClient.from("campaigns").update({ dm_levelup_lock: enabled }).eq("id", campaignId);
+    if(error) throw error;
+    if(campaignDetailData) campaignDetailData.campaign.dm_levelup_lock = enabled;
     renderPreserveScroll();
   }catch(e){
     showToast("Couldn't update that setting ("+(e&&e.message?e.message:"connection error")+").");
@@ -4043,10 +4124,11 @@ function renderCampaignDetailPage(id){
       <button class="ghost small" id="btn-campaign-back-to-hub">&larr; Back to Campaigns</button>
     </div>
     ${renderCampaignSettingsCard(campaign, isDm)}
+    ${isDm ? renderCampaignRollLogCard(rolls) : renderCampaignAdventurersCard(members, charsById)}
     ${renderCampaignMembersCard(members, charsById, isDm, campaign)}
     ${renderCampaignNotesCard(notes, isDm, members, charsById)}
-    ${isDm ? renderCampaignRollLogCard(rolls) : ""}
     ${renderNoteModal(isDm, members, charsById)}
+    ${renderPlayerSheetViewModal()}
     ${renderToast()}
   `;
 }
@@ -4054,31 +4136,73 @@ function renderCampaignDetailPage(id){
 function renderCampaignSettingsCard(campaign, isDm){
   if(!isDm){
     return `<div class="card open">
-      <div class="card-head"><h2 class="head-title">Campaign</h2></div>
-      <div class="card-body"><div class="item-box">Level-ups: <strong>${levelUpModeLabel(campaign.level_up_mode)}</strong></div></div>
+      <div class="card-head"><h2 class="head-title">Player Settings</h2></div>
+      <div class="card-body">
+        <div class="item-box">Level-ups: <strong>${campaign.dm_levelup_lock ? "Locked — DM grants only" : levelUpModeLabel(campaign.level_up_mode)}</strong></div>
+        ${campaign.dm_rest_control ? `<div class="item-box" style="margin-top:8px;">Rests: <strong>Your DM triggers Short/Long Rest for you</strong></div>` : ""}
+      </div>
     </div>`;
   }
   return `<div class="card open">
     <div class="card-head"><h2 class="head-title">Campaign Settings</h2></div>
     <div class="card-body">
       <div class="item-box" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
-        ${lbl("Level-ups","Who's allowed to grant a level-up: just you, players themselves, or either.")}
-        <select id="campaign-level-up-mode" style="width:auto;">
+        ${lbl("Level-ups","Who's allowed to grant a level-up: just you, players themselves, or either. Overridden entirely by the lock below while it's on.")}
+        <select id="campaign-level-up-mode" style="width:auto;" ${campaign.dm_levelup_lock?"disabled":""}>
           <option value="dm_only" ${campaign.level_up_mode==="dm_only"?"selected":""}>DM grants only</option>
           <option value="player_only" ${campaign.level_up_mode==="player_only"?"selected":""}>Players grant themselves</option>
           <option value="both" ${campaign.level_up_mode==="both"?"selected":""}>Either</option>
         </select>
       </div>
       <div class="item-box" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
-        <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
-          <input type="checkbox" id="campaign-dm-rest-control" ${campaign.dm_rest_control?"checked":""}>
-          <span>Let me trigger Short/Long Rest for players remotely</span>
+        <label class="campaign-toggle-label">
+          <input type="checkbox" class="check" id="campaign-dm-levelup-lock" ${campaign.dm_levelup_lock?"checked":""}>
+          <span>Lock players out of leveling up — only I can grant it</span>
         </label>
       </div>
+      <p class="small-label" style="margin:-4px 0 0;">While this is on, a player's class Level field is locked too (not just the self-grant button above) — they can't bump it themselves until you grant a level-up and they take it.</p>
+      <div class="item-box" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+        <label class="campaign-toggle-label">
+          <input type="checkbox" class="check" id="campaign-dm-rest-control" ${campaign.dm_rest_control?"checked":""}>
+          <span>Lock players out of Short/Long Rest — I trigger it remotely</span>
+        </label>
+      </div>
+      <p class="small-label" style="margin:-4px 0 0;">While this is on, a player's own Short Rest/Long Rest buttons on their sheet are disabled — use the Short Rest/Long Rest buttons on each player below instead.</p>
       <div class="toolbar">
         <button class="small" id="btn-copy-invite-link">&#128279; Copy Invite Link</button>
       </div>
       <p class="small-label">Anyone with this link can join as a player once they have an account — treat sharing it like inviting them directly. Each click of this button makes a fresh link; old ones you've already sent still work too.</p>
+    </div>
+  </div>`;
+}
+
+// Race display for a member's linked character, mirroring characterRaceName()'s own-sheet logic
+// but working off the small {raceBonus, customRace} slice pulled from that character's row
+// instead of the globally-active `state` (this runs over OTHER players' characters too).
+function memberRaceLabel(c){
+  if(!c) return "";
+  if(c.raceBonus==="__custom__") return c.customRace || "Custom Race";
+  return c.raceBonus || "Race not set";
+}
+
+// Read-only roster for the player view: every campaign member's character name and race, with
+// no DM controls or pending-action badges — just "who's playing what". Lives alongside, not in
+// place of, the Your Character/Players card below (that one also handles linking your own
+// character and, for the DM, the rest/level-up controls).
+function renderCampaignAdventurersCard(members, charsById){
+  const rows = members.map(m=>{
+    const c = m.character_id ? charsById[m.character_id] : null;
+    const name = (c && c.name) ? escapeHtml(c.name) : `<span class="small-label">No character linked</span>`;
+    const race = c ? escapeHtml(memberRaceLabel(c)) : "";
+    return `<div class="item-box campaign-row">
+      <div>${name}</div>
+      ${race ? `<span class="small-label">${race}</span>` : ""}
+    </div>`;
+  }).join("");
+  return `<div class="card open">
+    <div class="card-head"><h2 class="head-title">Adventurers</h2></div>
+    <div class="card-body">
+      ${rows || `<p class="small-label">No one has joined yet.</p>`}
     </div>
   </div>`;
 }
@@ -4095,6 +4219,16 @@ function renderCampaignMembersCard(members, charsById, isDm, campaign){
     const dmRestControls = (isDm && campaign.dm_rest_control && charName) ? `
         <button class="ghost small" data-trigger-rest="${m.user_id}" data-rest-kind="short" ${m.pending_rest?"disabled":""}>Short Rest</button>
         <button class="ghost small" data-trigger-rest="${m.user_id}" data-rest-kind="long" ${m.pending_rest?"disabled":""}>Long Rest</button>` : "";
+    // Opens a read-only replica of this player's sheet (same layout as Print/Save as PDF) in a
+    // modal, right from the campaign page — no more asking a player to export and send it over
+    // just so the DM can look something up.
+    const dmViewSheetControl = (isDm && m.character_id) ? `
+        <button class="ghost small" data-view-sheet-player="${m.character_id}" data-view-sheet-name="${escapeAttr(charName||"character")}">&#128214; View Sheet</button>` : "";
+    // Pulls this one player's full saved sheet straight from the cloud and downloads an AI-ready
+    // .md summary — the same format as the player's own "Export for AI / DM" button on their
+    // sheet, just triggered from the DM's side so nobody has to export-and-send it manually.
+    const dmAiExportControl = (isDm && m.character_id) ? `
+        <button class="ghost small" data-export-ai-player="${m.character_id}" data-export-ai-name="${escapeAttr(charName||"character")}">&#129302; AI Export</button>` : "";
     const linkPicker = (isYou && !charName && roster.index.length) ? `
       <div style="display:flex;gap:6px;align-items:center;">
         <select data-link-character-select="${m.id}" style="width:auto;">
@@ -4104,12 +4238,17 @@ function renderCampaignMembersCard(members, charsById, isDm, campaign){
       </div>` : "";
     return `<div class="item-box campaign-row">
       <div>${label}${youTag} ${pendingBadge} ${pendingRestBadge}</div>
-      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">${linkPicker}${dmControls}${dmRestControls}</div>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">${linkPicker}${dmControls}${dmRestControls}${dmViewSheetControl}${dmAiExportControl}</div>
     </div>`;
   }).join("");
+  const anyLinkedChars = isDm && members.some(m=>m.character_id);
+  const exportAllToolbar = anyLinkedChars ? `<div class="toolbar" style="margin-bottom:10px;">
+      <button class="small" id="btn-export-ai-all">&#129302; Export All for AI</button>
+    </div>` : "";
   return `<div class="card open">
     <div class="card-head"><h2 class="head-title">${isDm?"Players":"Your Character"}</h2></div>
     <div class="card-body">
+      ${exportAllToolbar}
       ${rows || `<p class="small-label">No one has joined yet. Copy the invite link above to bring in your first player.</p>`}
     </div>
   </div>`;
@@ -4145,9 +4284,9 @@ function renderCampaignNotesCard(notes, isDm, members, charsById){
 function renderNoteModal(isDm, members, charsById){
   if(!noteModalState || !isDm) return "";
   const n = noteModalState;
-  const checklist = members.map(m=>`<label style="display:flex;align-items:center;gap:6px;font-size:12.5px;padding:3px 0;">
-    <input type="checkbox" class="note-visible-to" value="${m.user_id}" ${n.visibleTo.includes(m.user_id)?"checked":""}>
-    ${escapeHtml(memberDisplayLabel(m, charsById))}
+  const checklist = members.map(m=>`<label class="note-visible-row">
+    <input type="checkbox" class="check note-visible-to" value="${m.user_id}" ${n.visibleTo.includes(m.user_id)?"checked":""}>
+    <span>${escapeHtml(memberDisplayLabel(m, charsById))}</span>
   </label>`).join("");
   return `<div class="auth-modal-overlay" id="note-modal-overlay">
     <div class="auth-modal wide">
@@ -4162,7 +4301,7 @@ function renderNoteModal(isDm, members, charsById){
           <option value="specific" ${n.visibility==="specific"?"selected":""}>Specific Players</option>
         </select>
       </div>
-      <div id="note-specific-players" style="${n.visibility==="specific"?"":"display:none;"}margin-bottom:8px;">
+      <div id="note-specific-players" class="item-box" style="${n.visibility==="specific"?"":"display:none;"}margin-bottom:8px;max-height:180px;overflow-y:auto;">
         ${checklist || `<p class="small-label">No players have joined yet.</p>`}
       </div>
       ${campaignNoteError?`<div class="auth-error">${escapeHtml(campaignNoteError)}</div>`:""}
@@ -4209,12 +4348,31 @@ async function deleteNote(campaignId, noteId){
   }
 }
 
+// Short pill text for the roll-kind column added alongside roll_label — a category (what the
+// roll was FOR), not flavor text. "normal" covers both a plain Quick d20 and a Roll-All with no
+// modifier selected, so it's labeled generically rather than claiming to be either one.
+function rollKindLabel(kind){
+  if(kind==="attack") return "Attack";
+  if(kind==="ability") return "Ability Check";
+  if(kind==="save") return "Saving Throw";
+  if(kind==="skill") return "Skill Check";
+  if(kind==="tool") return "Tool Check";
+  return "Normal Roll";
+}
+
 function renderCampaignRollLogCard(rolls){
   const rows = rolls.map(r=>{
     const flair = r.is_crit ? " &#10024;" : (r.is_fail ? " &#128128;" : "");
     const who = r.character_name || "Someone";
+    // breakdown is where the actual damage total lives for an attack roll (e.g. "To Hit: 18  •
+    // Damage: 7") — previously computed and stored but never actually shown here, so a crit or a
+    // hit only ever displayed the headline number with no damage next to it.
+    const breakdownLine = r.breakdown ? `<div class="small-label" style="margin-top:2px;">${escapeHtml(r.breakdown)}</div>` : "";
     return `<div class="item-box campaign-row" style="font-size:12.5px;">
-      <div><strong>${escapeHtml(who)}</strong> — ${escapeHtml(r.roll_label||"Roll")}: <strong>${r.total}</strong>${flair}</div>
+      <div style="flex:1;min-width:0;">
+        <div><strong>${escapeHtml(who)}</strong> <span class="visibility-badge">${rollKindLabel(r.roll_kind)}</span> — ${escapeHtml(r.roll_label||"Roll")}: <strong>${r.total}</strong>${flair}</div>
+        ${breakdownLine}
+      </div>
       <span class="small-label">${new Date(r.created_at).toLocaleTimeString()}</span>
     </div>`;
   }).join("");
@@ -4308,6 +4466,8 @@ function wireCampaignPageEvents(){
     if(modeSelect) modeSelect.addEventListener("change", ()=>updateLevelUpMode(campaign.id, modeSelect.value));
     const restControlToggle = document.getElementById("campaign-dm-rest-control");
     if(restControlToggle) restControlToggle.addEventListener("change", ()=>updateDmRestControl(campaign.id, restControlToggle.checked));
+    const levelupLockToggle = document.getElementById("campaign-dm-levelup-lock");
+    if(levelupLockToggle) levelupLockToggle.addEventListener("change", ()=>updateDmLevelupLock(campaign.id, levelupLockToggle.checked));
     const copyLinkBtn = document.getElementById("btn-copy-invite-link");
     if(copyLinkBtn) copyLinkBtn.addEventListener("click", ()=>copyInviteLink(campaign.id));
     document.querySelectorAll("[data-grant-levelup]").forEach(el=>{
@@ -4319,6 +4479,16 @@ function wireCampaignPageEvents(){
     document.querySelectorAll("[data-link-character-select]").forEach(el=>{
       el.addEventListener("change", ()=>linkCharacterToCampaign(el.getAttribute("data-link-character-select"), el.value));
     });
+    document.querySelectorAll("[data-export-ai-player]").forEach(el=>{
+      el.addEventListener("click", ()=>exportPlayerAiSummary(el.getAttribute("data-export-ai-player"), el.getAttribute("data-export-ai-name")));
+    });
+    const exportAllAiBtn = document.getElementById("btn-export-ai-all");
+    if(exportAllAiBtn) exportAllAiBtn.addEventListener("click", ()=>exportAllPlayersAiSummary(campaignDetailData.members, campaign.name));
+    document.querySelectorAll("[data-view-sheet-player]").forEach(el=>{
+      el.addEventListener("click", ()=>openPlayerSheetView(el.getAttribute("data-view-sheet-player"), el.getAttribute("data-view-sheet-name")));
+    });
+    const closeSheetViewBtn = document.getElementById("btn-close-player-sheet-view");
+    if(closeSheetViewBtn) closeSheetViewBtn.addEventListener("click", closePlayerSheetView);
     const addNoteBtn = document.getElementById("btn-add-note");
     if(addNoteBtn) addNoteBtn.addEventListener("click", ()=>{
       noteModalState = { id:null, title:"", body:"", visibility:"dm_only", visibleTo:[] };
@@ -5629,34 +5799,7 @@ function wireSettingsPageEvents(){
     input.click();
   });
   document.getElementById("btn-print-sheet").addEventListener("click", ()=>{
-    const printCss = `
-      body{background:#fff;color:#111;font-family:Arial,sans-serif;font-size:11px;max-width:800px;margin:0 auto;padding:16px;}
-      h1{font-family:Georgia,serif;font-size:24px;margin:0;}
-      h2{font-family:Georgia,serif;font-size:14px;margin:0 0 4px;border-bottom:1.5px solid #111;padding-bottom:2px;}
-      .ps-header{display:flex;justify-content:space-between;align-items:flex-start;border-bottom:2px solid #111;padding-bottom:8px;margin-bottom:10px;}
-      .ps-sub{font-size:12px;color:#333;margin-top:2px;}
-      .ps-grid{display:grid;gap:10px;margin-bottom:10px;}
-      .ps-grid-2{grid-template-columns:1fr 1fr;}
-      .ps-grid-3{grid-template-columns:1fr 1fr 1fr;}
-      .ps-box-section{border:1.5px solid #111;border-radius:4px;padding:8px;break-inside:avoid;}
-      .ps-abil-row{display:grid;grid-template-columns:repeat(6,1fr);gap:6px;margin-bottom:10px;}
-      .ps-abil-box{border:1.5px solid #111;border-radius:6px;text-align:center;padding:4px 2px;}
-      .ps-abil-label{font-size:10px;font-weight:600;letter-spacing:.05em;}
-      .ps-abil-mod{font-size:18px;font-weight:700;font-family:Georgia,serif;}
-      .ps-abil-score{font-size:10px;color:#333;}
-      .ps-line{display:flex;align-items:center;gap:6px;padding:2px 0;border-bottom:1px dotted #999;}
-      .ps-line .ps-fill{margin-left:auto;font-weight:600;}
-      .ps-box{display:inline-block;width:12px;height:12px;border:1px solid #111;text-align:center;line-height:11px;font-size:9px;flex-shrink:0;}
-      table{width:100%;border-collapse:collapse;margin-bottom:8px;}
-      th,td{border:1px solid #111;padding:3px 5px;font-size:10.5px;text-align:left;}
-      th{background:#eee;}
-      .ps-feature{padding:2px 0;border-bottom:1px dotted #ccc;}
-      .ps-blank-lines{border-bottom:1px solid #999;height:16px;margin-bottom:4px;}
-      .ps-footer{text-align:center;color:#666;font-size:9px;margin-top:14px;}
-      @media print{ .ps-print-btn{ display:none !important; } }
-      .ps-print-btn{ display:block; margin:0 auto 14px; padding:10px 18px; font-size:13px; cursor:pointer; }
-    `;
-    const html = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>${escapeAttr(state.name||"Character Sheet")}</title><style>${printCss}</style></head>
+    const html = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>${escapeAttr(state.name||"Character Sheet")}</title><style>${printSheetStyles()}</style></head>
       <body>
         <button class="ps-print-btn" onclick="window.print()">Print / Save as PDF</button>
         ${buildPrintSheetHtml()}
@@ -5716,6 +5859,8 @@ function skullOverlay(){
 function renderMasthead(){
   const classSummary = state.classes.filter(c=>c.cls).map(c=>`${c.cls} ${c.level}`).join(" / ") || "Unclassed";
   const dead = !!state.isDead;
+  const restLocked = restLockedByDm();
+  const restLockTitleSuffix = restLocked ? " Your DM is controlling rests for this campaign right now — use the campaign page's remote trigger, or wait for them." : "";
   const avatar = state.profileImage
     ? `<div style="position:relative;width:52px;height:52px;flex-shrink:0;">
         <img src="${state.profileImage}" style="width:52px;height:52px;border-radius:50%;object-fit:cover;border:2px solid var(--brass);display:block;" alt="Profile picture">
@@ -5739,8 +5884,8 @@ function renderMasthead(){
     </div>
     <div style="display:flex;gap:6px;flex-shrink:0;flex-wrap:wrap;justify-content:flex-end;">
       <button class="small" id="btn-quick-d20" title="Roll a plain d20 — no modifiers, no proficiency, nothing added. Just the die.">&#127922; Roll d20</button>
-      <button class="ghost small" id="btn-short-rest" title="Short Rest: restores Pact Magic slots, Superiority Dice, and Ki. Spending Hit Dice to heal is still up to you — adjust Current HP and Hit Dice Used manually.">&#9203; Short Rest</button>
-      <button class="ghost small" id="btn-long-rest" title="Long Rest: restores all HP and spell slots (including Pact Magic, Superiority Dice, and Ki), removes Temp HP, regains up to half your Hit Dice, resets Mystic Arcanum, reduces Exhaustion by 1, clears conditions and death saves, and turns off active toggleable features (like Rage).">&#127769; Long Rest</button>
+      <button class="ghost small" id="btn-short-rest" ${restLocked?"disabled":""} title="Short Rest: restores Pact Magic slots, Superiority Dice, and Ki. Spending Hit Dice to heal is still up to you — adjust Current HP and Hit Dice Used manually.${restLockTitleSuffix}">&#9203; Short Rest</button>
+      <button class="ghost small" id="btn-long-rest" ${restLocked?"disabled":""} title="Long Rest: restores all HP and spell slots (including Pact Magic, Superiority Dice, and Ki), removes Temp HP, regains up to half your Hit Dice, resets Mystic Arcanum, reduces Exhaustion by 1, clears conditions and death saves, and turns off active toggleable features (like Rage).${restLockTitleSuffix}">&#127769; Long Rest</button>
       <button class="ghost small" id="btn-toggle-dead" title="${dead?"Revive this character.":"Mark this character as deceased — shows a skull over their pictures and crosses out their name."}">
         &#128128; ${dead?"Revive":"Mark Deceased"}
       </button>
@@ -6725,6 +6870,7 @@ function rollAttackAndShow(atkIdx){
     isCrit: toHit.isNat20,
     isFail: toHit.isNat1,
     dieFace: attackDieFace,
+    rollKind: "attack",
     onReveal: ()=>{
       state.diceRoller.attackResult = {name, toHit, damage:{lines:damageLines, total:damageTotal}, gwfNote, masteryNote};
       saveState(); renderPreserveScroll();
@@ -6811,7 +6957,7 @@ let diceRollLocked = false;
 // outcome ahead of the animation. Nothing about `total`/`label`/etc. above leaks early either —
 // they only ever reach the DOM inside the overlay's own innerHTML, which stays display:none via
 // CSS until the reveal.
-function triggerDiceFx({total, label, breakdown, isCrit, isFail, dieFace, onReveal}){
+function triggerDiceFx({total, label, breakdown, isCrit, isFail, dieFace, onReveal, rollKind}){
   if(diceRollLocked) return;
   const overlay = document.getElementById("dice-fx-overlay");
   if(!overlay){ if(typeof onReveal==="function") onReveal(); return; }
@@ -6867,7 +7013,7 @@ function triggerDiceFx({total, label, breakdown, isCrit, isFail, dieFace, onReve
     // Fire-and-forget: streams this roll to the DM's live roll log if this character is linked
     // into a campaign. Deliberately held until right here (not back at trigger time) so the DM's
     // feed can't tip anyone off to the result before the roller's own screen reveals it either.
-    logRollToCampaigns({total, label, breakdown, isCrit, isFail});
+    logRollToCampaigns({total, label, breakdown, isCrit, isFail, rollKind});
     if(typeof onReveal === "function") onReveal();
   }, spinDuration);
 }
@@ -7825,6 +7971,13 @@ function renderClassesCard(t){
   // homebrew class (tracked by its own customName), so it isn't a real duplicate the way picking
   // "Fighter" a second time would be.
   const chosenClasses = new Set(state.classes.filter(c=>c.cls && c.cls!=="Custom").map(c=>c.cls));
+  // When the DM has leveling up locked for this campaign and there's no grant waiting to be
+  // taken (or just-taken-but-not-yet-applied — see levelFieldLocked()), the Level number itself
+  // is locked too — otherwise a player could just type a higher number in and skip the whole
+  // grant/take ceremony entirely. "+ Add class" is locked right along with it, since starting a
+  // new class at level 1 raises total level the exact same way.
+  const levelsLocked = levelFieldLocked();
+  const levelLockTitle = "Your DM controls leveling up for this campaign — wait for them to grant you a level-up.";
   const rows = state.classes.map((c,i)=>{
     const lvl = parseInt(c.level)||0;
     const subLevel = c.cls ? (SUBCLASS_LEVEL[c.cls]||1) : 1;
@@ -7924,7 +8077,7 @@ function renderClassesCard(t){
       </div>
       <div style="display:flex;gap:6px;align-items:center;">
         <div style="flex:0 0 92px;">
-          <input type="number" min="1" max="20" data-class="level" value="${c.level}" title="Your level in this class.">
+          <input type="number" min="1" max="20" data-class="level" value="${c.level}" ${levelsLocked?`disabled title="${levelLockTitle}"`:`title="Your level in this class."`}>
         </div>
         <div style="flex:1;">
           ${isCustom ? `<input disabled value="No subclass for a Custom class" style="opacity:0.6;">` : subclassField}
@@ -8028,7 +8181,7 @@ function renderClassesCard(t){
   return `
     <div class="small-label" style="margin-bottom:6px;">Class / Level / Subclass — add another row to multiclass</div>
     ${rows}
-    <button class="ghost small" id="btn-add-class">+ Add class (multiclass)</button>
+    <button class="ghost small" id="btn-add-class" ${levelsLocked?`disabled title="${levelLockTitle}"`:""}>+ Add class (multiclass)</button>
     <hr class="divider">
     <div class="small-label">Total character level: <strong>${t}</strong> &middot; Proficiency bonus: <strong>${fmt(profBonus())}</strong></div>
     ${featuresHtml}
@@ -8905,6 +9058,149 @@ function buildAiSummaryText(){
   return lines.join("\n");
 }
 
+// --- DM-side AI export for a campaign's players --------------------------------------------
+// Builds the exact same .md summary as a player's own "Export for AI / DM" button, but run
+// against another character's saved data instead of the globally-active `state` — so the DM
+// doesn't have to ask every player to export their own sheet and send it over. `state` is a
+// plain `let` at module scope, so swapping it for the duration of one synchronous call (no
+// awaits in between) and restoring it right after is safe; nothing else reads or renders while
+// this runs.
+function buildAiSummaryTextFor(characterData){
+  const prevState = state;
+  state = characterData;
+  try{
+    return buildAiSummaryText();
+  } finally {
+    state = prevState;
+  }
+}
+
+async function exportPlayerAiSummary(characterId, characterName){
+  if(!characterId){ showToast("That player hasn't linked a character yet."); return; }
+  try{
+    const data = await cloudLoadCharacterData(characterId);
+    const text = buildAiSummaryTextFor(data);
+    await saveFile((characterName||"character") + "-ai-summary.md", text);
+  }catch(e){
+    showToast("Couldn't export that character's AI summary ("+(e&&e.message?e.message:"connection error")+").");
+  }
+}
+
+async function exportAllPlayersAiSummary(members, campaignName){
+  const linked = (members||[]).filter(m=>m.character_id);
+  if(!linked.length){ showToast("No players have linked a character yet."); return; }
+  showToast(`Exporting ${linked.length} player sheet${linked.length===1?"":"s"}…`);
+  try{
+    const sections = [];
+    for(const m of linked){
+      const data = await cloudLoadCharacterData(m.character_id);
+      sections.push(buildAiSummaryTextFor(data));
+    }
+    const combined = sections.join("\n\n---\n\n");
+    await saveFile((campaignName||"campaign") + "-player-sheets-ai-export.md", combined);
+    showToast("Downloaded — hand this file to your AI tool to bring it up to date on your players.");
+  }catch(e){
+    showToast("Couldn't export the player sheets ("+(e&&e.message?e.message:"connection error")+").");
+  }
+}
+
+// --- DM-side read-only "View Sheet" for a campaign player -----------------------------------
+// Reuses the Print/Save-as-PDF layout (buildPrintSheetHtml) instead of re-rendering the whole
+// interactive character sheet in a disabled state — that would mean shadowing every single input
+// across thousands of lines of sheet UI just to make it non-editable. The print layout already is
+// a complete, read-only, nothing-to-click rendering of the full sheet (abilities, attacks, spells,
+// features, equipment, etc.), so it doubles as exactly what a DM peeking at a player's sheet needs.
+let campaignSheetViewState = null; // null when closed, else {characterId, characterName, loading, error, html}
+
+function buildPrintSheetHtmlFor(characterData){
+  const prevState = state;
+  state = characterData;
+  try{
+    return buildPrintSheetHtml();
+  } finally {
+    state = prevState;
+  }
+}
+
+async function openPlayerSheetView(characterId, characterName){
+  if(!characterId){ showToast("That player hasn't linked a character yet."); return; }
+  campaignSheetViewState = { characterId, characterName: characterName || "Character", loading:true, error:"", html:"" };
+  renderPreserveScroll();
+  try{
+    const data = await cloudLoadCharacterData(characterId);
+    const html = buildPrintSheetHtmlFor(data);
+    // The DM may have closed the modal, or clicked a different player, while this was in flight.
+    if(!campaignSheetViewState || campaignSheetViewState.characterId !== characterId) return;
+    campaignSheetViewState.html = html;
+    campaignSheetViewState.loading = false;
+  }catch(e){
+    if(campaignSheetViewState && campaignSheetViewState.characterId === characterId){
+      campaignSheetViewState.loading = false;
+      campaignSheetViewState.error = "Couldn't load that character's sheet ("+(e&&e.message?e.message:"connection error")+").";
+    }
+  }
+  renderPreserveScroll();
+}
+
+function closePlayerSheetView(){
+  campaignSheetViewState = null;
+  renderPreserveScroll();
+}
+
+function renderPlayerSheetViewModal(){
+  if(!campaignSheetViewState) return "";
+  const s = campaignSheetViewState;
+  const body = s.loading
+    ? `<p class="small-label">Loading sheet…</p>`
+    : (s.error
+      ? `<p style="color:var(--wine-light);">${escapeHtml(s.error)}</p>`
+      : `<style>${printSheetStyles()}</style>${s.html}`);
+  return `<div class="auth-modal-overlay" id="player-sheet-view-overlay">
+    <div class="auth-modal wide" style="max-width:820px;max-height:88vh;display:flex;flex-direction:column;">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:10px;">
+        <h2 style="margin:0;">${escapeHtml(s.characterName)}</h2>
+        <button class="ghost small" id="btn-close-player-sheet-view">&times; Close</button>
+      </div>
+      <div style="overflow-y:auto;flex:1;background:#fff;border-radius:6px;padding:14px;">
+        ${body}
+      </div>
+    </div>
+  </div>`;
+}
+
+// Shared by the Print / Save as PDF button (wrapped in a full standalone document for a new tab)
+// and the DM's read-only "View Sheet" modal (wrapped in a scrollable panel instead) — same
+// print-styled layout either way, just two different containers around it.
+function printSheetStyles(){
+  return `
+      body{background:#fff;color:#111;font-family:Arial,sans-serif;font-size:11px;max-width:800px;margin:0 auto;padding:16px;}
+      h1{font-family:Georgia,serif;font-size:24px;margin:0;}
+      h2{font-family:Georgia,serif;font-size:14px;margin:0 0 4px;border-bottom:1.5px solid #111;padding-bottom:2px;}
+      .ps-header{display:flex;justify-content:space-between;align-items:flex-start;border-bottom:2px solid #111;padding-bottom:8px;margin-bottom:10px;}
+      .ps-sub{font-size:12px;color:#333;margin-top:2px;}
+      .ps-grid{display:grid;gap:10px;margin-bottom:10px;}
+      .ps-grid-2{grid-template-columns:1fr 1fr;}
+      .ps-grid-3{grid-template-columns:1fr 1fr 1fr;}
+      .ps-box-section{border:1.5px solid #111;border-radius:4px;padding:8px;break-inside:avoid;}
+      .ps-abil-row{display:grid;grid-template-columns:repeat(6,1fr);gap:6px;margin-bottom:10px;}
+      .ps-abil-box{border:1.5px solid #111;border-radius:6px;text-align:center;padding:4px 2px;}
+      .ps-abil-label{font-size:10px;font-weight:600;letter-spacing:.05em;}
+      .ps-abil-mod{font-size:18px;font-weight:700;font-family:Georgia,serif;}
+      .ps-abil-score{font-size:10px;color:#333;}
+      .ps-line{display:flex;align-items:center;gap:6px;padding:2px 0;border-bottom:1px dotted #999;}
+      .ps-line .ps-fill{margin-left:auto;font-weight:600;}
+      .ps-box{display:inline-block;width:12px;height:12px;border:1px solid #111;text-align:center;line-height:11px;font-size:9px;flex-shrink:0;}
+      table{width:100%;border-collapse:collapse;margin-bottom:8px;}
+      th,td{border:1px solid #111;padding:3px 5px;font-size:10.5px;text-align:left;}
+      th{background:#eee;}
+      .ps-feature{padding:2px 0;border-bottom:1px dotted #ccc;}
+      .ps-blank-lines{border-bottom:1px solid #999;height:16px;margin-bottom:4px;}
+      .ps-footer{text-align:center;color:#666;font-size:9px;margin-top:14px;}
+      @media print{ .ps-print-btn{ display:none !important; } }
+      .ps-print-btn{ display:block; margin:0 auto 14px; padding:10px 18px; font-size:13px; cursor:pointer; }
+    `;
+}
+
 function buildPrintSheetHtml(){
   const t = totalLevel();
   const pb = profBonus();
@@ -9316,6 +9612,11 @@ function wireImageHandling(){
 function performShortRest(opts){
   opts = opts || {};
   if(state.isDead){ showToast("This character is deceased — resting doesn't restore anything. Revive them first (top of the sheet) if that was a mistake."); return; }
+  // The masthead button is already disabled while this is true, but that's a UI nicety, not the
+  // actual gate — this check is what really stops a self-triggered rest when the DM has taken
+  // control. `opts.triggeredByDm` is how the DM's own remote trigger (applyRemoteRest) calls back
+  // in, so it always passes straight through regardless of the lock.
+  if(!opts.triggeredByDm && restLockedByDm()){ showToast("Your DM controls rests for this campaign right now — wait for them to trigger it."); return; }
   let restored = [];
   if((state.pactSlotsUsed||0) > 0 && state.classes.some(c=>c.cls==="Warlock")){ restored.push("Pact Magic slots"); }
   state.pactSlotsUsed = 0;
@@ -9332,6 +9633,7 @@ function performShortRest(opts){
 function performLongRest(opts){
   opts = opts || {};
   if(state.isDead){ showToast("This character is deceased — resting doesn't restore anything. Revive them first (top of the sheet) if that was a mistake."); return; }
+  if(!opts.triggeredByDm && restLockedByDm()){ showToast("Your DM controls rests for this campaign right now — wait for them to trigger it."); return; }
   const restored = [];
   if(state.hp.current < autoMaxHP()){ restored.push("HP to full"); }
   state.hp.current = autoMaxHP();
@@ -9763,6 +10065,9 @@ function wireEvents(){
       isCrit: anyNat20,
       isFail: anyNat1,
       dieFace: rollDieFace,
+      // state.diceRoller.rollType is "none"/"ability"/"save"/"skill"/"tool" — "none" maps to the
+      // generic "normal" category the DM's roll log understands.
+      rollKind: (state.diceRoller.rollType && state.diceRoller.rollType!=="none") ? state.diceRoller.rollType : "normal",
       onReveal: ()=>{
         state.diceRoller.results = {rolls, total:grandTotal, modifier};
         saveState(); renderPreserveScroll();
@@ -9907,7 +10212,8 @@ function wireEvents(){
       breakdown: null,
       isCrit: roll===20,
       isFail: roll===1,
-      dieFace: 20
+      dieFace: 20,
+      rollKind: "normal"
     });
   });
 
@@ -9931,6 +10237,9 @@ function wireEvents(){
 
   const addClassBtn = document.getElementById("btn-add-class");
   if(addClassBtn) addClassBtn.addEventListener("click", ()=>{
+    // The button is already disabled while locked — this is the actual gate, same pattern as
+    // performShortRest/performLongRest's own check.
+    if(levelFieldLocked()){ showToast("Your DM controls leveling up for this campaign — wait for them to grant you a level-up."); return; }
     if(state.classes.length>=4){ showToast("That's a lot of classes — edit the existing rows if you need more."); }
     state.classes.push({cls:"",level:1,subclass:""}); saveState(); renderPreserveScroll();
   });
@@ -9956,6 +10265,13 @@ function wireEvents(){
       const row = el.closest("[data-class-idx]");
       const idx = parseInt(row.getAttribute("data-class-idx"));
       const field = el.getAttribute("data-class");
+      // The input itself is already disabled while locked, same defense-in-depth as Add Class
+      // above — this is what actually stops a level change, not just the disabled attribute.
+      if(field==="level" && levelFieldLocked()){
+        el.value = state.classes[idx].level;
+        showToast("Your DM controls leveling up for this campaign — wait for them to grant you a level-up.");
+        return;
+      }
       state.classes[idx][field] = field==="level" ? Math.max(1,Math.min(20,parseInt(el.value)||1)) : el.value;
       if(field==="cls"){
         state.classes[idx].subclass = "";
