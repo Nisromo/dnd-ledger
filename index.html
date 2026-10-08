@@ -102,8 +102,8 @@
      mid-animation. */
   #dice-fx-overlay{
     position:fixed; inset:0; z-index:2000; display:none;
-    align-items:center; justify-content:center; background:rgba(0,0,0,0.55);
-    cursor:pointer;
+    flex-direction:column; align-items:center; justify-content:center; gap:18px;
+    background:rgba(0,0,0,0.55);
   }
   #dice-fx-overlay.show{ display:flex; }
   .dice-fx-die{
@@ -152,6 +152,20 @@
     max-width:90%; min-width:170px; min-height:170px;
   }
   .dice-fx-result.show{ display:flex; }
+  /* The only way this card closes now — no auto-timeout, no click-anywhere-to-dismiss — so a
+     roll made mid-combat stays on screen exactly as long as the table needs it, same as a
+     physical die left sitting on the table until the DM has seen it. A plain button BELOW the
+     card (not a small corner X on the card itself) because the card's shape often has a
+     clip-path cut to the die's actual face (hexagon, pentagon, kite, etc.) — anything sitting in
+     a corner of the card gets clipped away right along with it and becomes invisible. Appended
+     fresh only once the spin actually finishes (see triggerDiceFx), so it can't be clicked to
+     skip the animation early. */
+  .dice-fx-dismiss-btn{
+    padding:9px 22px; border-radius:8px; font-size:14px; font-weight:600;
+    background:var(--brass); border:1px solid var(--brass-light); color:var(--leather);
+    cursor:pointer; animation: diceFxPop 0.35s cubic-bezier(.34,1.56,.64,1) both;
+  }
+  .dice-fx-dismiss-btn:hover{ background:var(--brass-light); }
   .dice-fx-result.crit{ border-color:#ffd24a; box-shadow:0 0 40px 10px rgba(255,200,60,0.55); }
   .dice-fx-result.fail{ border-color:var(--wine); box-shadow:0 0 40px 10px rgba(180,30,30,0.5); }
   .dice-fx-total{ font-family:'Spectral',serif; font-size:46px; font-weight:700; color:var(--brass-light); line-height:1.1; }
@@ -161,7 +175,7 @@
   .dice-fx-breakdown{ font-size:12px; color:var(--ink-soft); }
   @keyframes diceFxPop{ 0%{ transform:scale(0.5); opacity:0; } 100%{ transform:scale(1); opacity:1; } }
   @media (prefers-reduced-motion: reduce){
-    .dice-fx-result{ animation:none !important; }
+    .dice-fx-result, .dice-fx-dismiss-btn{ animation:none !important; }
   }
 
   /* The dropdown's OPEN option list is a native browser layer that ignores the select's own
@@ -3238,14 +3252,26 @@ let authBusy = false;
 
 function isCloudMode(){ return !!authUser; }
 
+// Persistent top-bar nav — present no matter which of the three views (sheet/settings/campaign)
+// is on screen, since #auth-bar is its own fixed element outside #app and only renderAuthBar()
+// touches it. That's what lets Settings and the Campaign Tracker drop their own per-page "Back
+// to Character Sheet" buttons: this row is always right there above them instead.
 function renderAuthBar(){
   const bar = document.getElementById("auth-bar");
   if(!bar) return;
+  const navBtns = `<button class="ghost small" id="btn-nav-character-sheet">Character Sheet</button><button class="ghost small" id="btn-nav-dungeon-master">Dungeon Master</button>`;
+  const gearBtn = `<button class="ghost small icon" id="btn-open-section-settings" title="Settings — theme, which sections are visible, and export/import.">&#9881;</button>`;
   if(authUser){
-    bar.innerHTML = `<span>Signed in as ${escapeHtml(authUser.email)} — your characters sync to this account</span><span class="ab-spacer"></span><button class="ghost small" id="btn-sign-out">Sign Out</button>`;
+    bar.innerHTML = `${navBtns}<span>Signed in as ${escapeHtml(authUser.email)}</span><span class="ab-spacer"></span><button class="ghost small" id="btn-sign-out">Sign Out</button>${gearBtn}`;
   } else {
-    bar.innerHTML = `<span class="ab-spacer"></span><button class="ghost small" id="btn-show-login">Log In</button><button class="small" id="btn-show-signup">Sign Up</button>`;
+    bar.innerHTML = `${navBtns}<span class="ab-spacer"></span><button class="ghost small" id="btn-show-login">Log In</button><button class="small" id="btn-show-signup">Sign Up</button>${gearBtn}`;
   }
+  const navSheetBtn = document.getElementById("btn-nav-character-sheet");
+  if(navSheetBtn) navSheetBtn.addEventListener("click", goToSheet);
+  const navDmBtn = document.getElementById("btn-nav-dungeon-master");
+  if(navDmBtn) navDmBtn.addEventListener("click", goToCampaignHub);
+  const gearBtnEl = document.getElementById("btn-open-section-settings");
+  if(gearBtnEl) gearBtnEl.addEventListener("click", goToSettings);
   const signOutBtn = document.getElementById("btn-sign-out");
   if(signOutBtn) signOutBtn.addEventListener("click", async ()=>{
     try{ await supabaseClient.auth.signOut(); }catch(e){}
@@ -3497,9 +3523,6 @@ function renderCampaignPage(){
   return "";
 }
 
-function campaignBackButton(){
-  return `<button class="ghost small" id="btn-campaign-nav-back">&larr; Back to Character Sheet</button>`;
-}
 function campaignSignInPrompt(message){
   return `<div class="card open"><div class="card-body">
     <p>${escapeHtml(message)}</p>
@@ -3566,7 +3589,6 @@ async function createCampaign(){
 function renderCampaignHubPage(){
   const header = `<div class="masthead" style="justify-content:space-between;align-items:center;flex-wrap:wrap;">
     <h1>Campaigns</h1>
-    ${campaignBackButton()}
   </div>`;
   if(!authUser){
     return header + campaignSignInPrompt("Campaigns need an account, so the DM and every player always see the same live data. Log in or sign up to create or join one.");
@@ -4228,7 +4250,6 @@ async function acceptInvite(code, characterId){
 function renderCampaignJoinPage(code){
   const header = `<div class="masthead" style="justify-content:space-between;align-items:center;flex-wrap:wrap;">
     <h1>Join Campaign</h1>
-    ${campaignBackButton()}
   </div>`;
   if(!authUser){
     return header + campaignSignInPrompt("You've been invited to join a D&D campaign! Create an account or log in — you'll land right back here and can finish joining.");
@@ -4254,8 +4275,6 @@ function renderCampaignJoinPage(code){
 }
 
 function wireCampaignPageEvents(){
-  const backBtn = document.getElementById("btn-campaign-nav-back");
-  if(backBtn) backBtn.addEventListener("click", goToSheet);
   const hubBtn = document.getElementById("btn-campaign-back-to-hub");
   if(hubBtn) hubBtn.addEventListener("click", goToCampaignHub);
 
@@ -5462,7 +5481,6 @@ function renderSettingsPage(){
   return `
     <div class="masthead" style="justify-content:space-between;align-items:center;flex-wrap:wrap;">
       <h1>Settings</h1>
-      <button class="ghost small" id="btn-back-to-sheet">&larr; Back to Character Sheet</button>
     </div>
 
     <div class="card open">
@@ -5515,9 +5533,6 @@ function renderSettingsPage(){
       </div>
     </div>
 
-    <div style="display:flex;justify-content:flex-start;margin-top:4px;">
-      <button class="ghost small" id="btn-back-to-sheet-bottom">&larr; Back to Character Sheet</button>
-    </div>
     ${renderToast()}
     ${renderHelpPopup()}
   `;
@@ -5546,9 +5561,6 @@ function goToSheet(){
 }
 
 function wireSettingsPageEvents(){
-  document.getElementById("btn-back-to-sheet").addEventListener("click", goToSheet);
-  document.getElementById("btn-back-to-sheet-bottom").addEventListener("click", goToSheet);
-
   app.querySelectorAll("[data-section-visible]").forEach(el=>{
     el.addEventListener("change", ()=>{
       const key = el.getAttribute("data-section-visible");
@@ -5732,8 +5744,6 @@ function renderMasthead(){
       <button class="ghost small" id="btn-toggle-dead" title="${dead?"Revive this character.":"Mark this character as deceased — shows a skull over their pictures and crosses out their name."}">
         &#128128; ${dead?"Revive":"Mark Deceased"}
       </button>
-      <button class="ghost small icon" id="btn-open-campaigns" title="Campaign Tracker — run or join a live multiplayer campaign.">&#9876;&#65039;</button>
-      <button class="ghost small icon" id="btn-open-section-settings" title="Settings — theme, which sections are visible, and export/import.">&#9881;</button>
     </div>
   </div>`;
 }
@@ -6786,13 +6796,13 @@ function dieShapeInfo(dieFace){
 // rolling doesn't cut the animation off. dieFace (e.g. 20 for a d20) shapes both the spinning
 // icon and the result card's outline to match the die actually rolled, in the current theme's
 // colors; omit it (or pass a mixed roll's null) to fall back to the plain emoji + square card.
-let diceFxDismissTimer = null;
 // True for exactly the 2-second spin of the most recent roll — every roll trigger (Roll All,
 // an attack, Quick d20) checks this FIRST and bails out before touching any state if a roll is
 // already spinning, so mashing the button can't quietly recompute/overwrite a result behind the
-// animation's back. The overlay itself also can't be click-dismissed until the spin is actually
-// done, closing the other way someone could skip past it. Cleared the moment the spin ends —
-// the result card lingering afterward doesn't keep the next roll locked out.
+// animation's back. The result card itself has no way to be dismissed at all until the spin is
+// actually done — see the &times; close button below — closing the other way someone could skip
+// past it. Cleared the moment the spin ends — the result card lingering afterward (now
+// indefinitely, until the player closes it themselves) doesn't keep the next roll locked out.
 let diceRollLocked = false;
 // `onReveal`, if given, fires at the exact moment the spin ends and the number becomes visible
 // (same instant as `diceRollLocked` clearing below) — never earlier. Callers use it to commit the
@@ -6806,7 +6816,6 @@ function triggerDiceFx({total, label, breakdown, isCrit, isFail, dieFace, onReve
   const overlay = document.getElementById("dice-fx-overlay");
   if(!overlay){ if(typeof onReveal==="function") onReveal(); return; }
   diceRollLocked = true;
-  clearTimeout(diceFxDismissTimer);
   const shape = dieShapeInfo(dieFace);
   const shapeStyle = shape ? `clip-path:${shape.clip||"none"};${shape.circle?"border-radius:50%;":(shape.clip?"border-radius:0;":"")}` : "";
   const resultStyle = shape ? `${shapeStyle}${shape.pad?`padding:${shape.pad};`:""}` : "";
@@ -6826,10 +6835,13 @@ function triggerDiceFx({total, label, breakdown, isCrit, isFail, dieFace, onReve
   resultEl.classList.toggle("crit", !!isCrit);
   resultEl.classList.toggle("fail", !!isFail);
   overlay.classList.add("show");
-  const dismiss = ()=>{ overlay.classList.remove("show"); overlay.innerHTML = ""; overlay.onclick = null; };
-  // Deliberately NOT click-dismissable yet — that was the other way someone could skip past the
-  // spin early. It becomes clickable again once the spin finishes, below.
-  overlay.onclick = null;
+  // No auto-dismiss timer and no click-anywhere-on-the-backdrop — a roll made mid-combat is
+  // meant to sit there until the table has actually looked at it, same as a physical die left on
+  // the table. The ONLY way it closes is the "Dice Rolled" button appended below the card once
+  // the spin finishes (see the setTimeout below) — not a small X on the card itself, since the
+  // card's shape is often clipped to the die's actual face (hexagon, pentagon, kite, etc.) and
+  // anything sitting in a corner of it gets clipped away right along with it.
+  const dismiss = ()=>{ overlay.classList.remove("show"); overlay.innerHTML = ""; };
   // The dice spin always runs its full 2 seconds — this is a personal tool for one table, not
   // a public page, so there's no reason to let an OS-level "reduce motion" setting silently cut
   // the roll short. (It still trims the subtler result-pop animation via the CSS media query
@@ -6843,15 +6855,21 @@ function triggerDiceFx({total, label, breakdown, isCrit, isFail, dieFace, onReve
       r.classList.add("show");
       if(isCrit) playCritFanfare(); else if(isFail) playFailThud();
     }
-    overlay.onclick = dismiss; // the mandatory wait is over — happy to be dismissed early now
-    diceRollLocked = false; // ...and the next roll may begin
+    // Appended fresh only now, after the spin is actually done, so it can never be clicked to
+    // skip the animation early.
+    const dismissBtn = document.createElement("button");
+    dismissBtn.className = "dice-fx-dismiss-btn";
+    dismissBtn.id = "dice-fx-dismiss-btn";
+    dismissBtn.textContent = "Dice Rolled — Dismiss";
+    dismissBtn.addEventListener("click", dismiss);
+    overlay.appendChild(dismissBtn);
+    diceRollLocked = false; // the next roll may begin — the result card itself just stays put
     // Fire-and-forget: streams this roll to the DM's live roll log if this character is linked
     // into a campaign. Deliberately held until right here (not back at trigger time) so the DM's
     // feed can't tip anyone off to the result before the roller's own screen reveals it either.
     logRollToCampaigns({total, label, breakdown, isCrit, isFail});
     if(typeof onReveal === "function") onReveal();
   }, spinDuration);
-  diceFxDismissTimer = setTimeout(dismiss, spinDuration + 2200);
 }
 
 function renderDiceRollerCard(){
@@ -10555,10 +10573,6 @@ function wireEvents(){
       deleteCharacterSheet(roster.activeId);
     });
   }
-  const openSectionSettingsBtn = document.getElementById("btn-open-section-settings");
-  if(openSectionSettingsBtn) openSectionSettingsBtn.addEventListener("click", goToSettings);
-  const openCampaignsBtn = document.getElementById("btn-open-campaigns");
-  if(openCampaignsBtn) openCampaignsBtn.addEventListener("click", goToCampaignHub);
   const takeLevelUpBtn = document.getElementById("btn-take-level-up");
   if(takeLevelUpBtn) takeLevelUpBtn.addEventListener("click", takeLevelUp);
   const selfGrantLevelUpBtn = document.getElementById("btn-self-grant-level-up");
